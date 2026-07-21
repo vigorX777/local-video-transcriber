@@ -1,0 +1,63 @@
+# Local Video Transcriber
+
+在 Apple Silicon Mac 上本地完成视频语音识别，再生成经过翻译、润色和章节整理的中文 JSON 与 Markdown。既可以使用命令行，也可以通过仅本机访问的浏览器工作台操作。
+
+## 当前状态
+
+默认流程由 Gemini 2.5 Flash 负责英文翻译、中文润色、总标题和章节标题；Whisper 原始 JSON、时间轴与验证仍保留在本机。浏览器工作台支持选择本地视频、查看阶段与块级进度、预览 Markdown、下载、复制和导入 Obsidian。
+
+输入视频位于项目外部，例如 `/path/to/video.mp4`。
+
+项目不会复制或修改原视频。模型文件、中间音频和转写结果保留在本机，但不提交 Git。
+
+## 使用
+
+首次执行会安装 Python Web 依赖、前端依赖、`ffmpeg`、`whisper-cpp`，并下载约 1.6GB 的 Whisper 模型：
+
+```bash
+./scripts/setup.sh
+```
+
+一键启动并打开浏览器工作台：
+
+```bash
+./start-workbench.sh
+```
+
+它会复用已运行的本机工作台；若服务尚未启动，则在后台启动后自动打开 <http://127.0.0.1:8765>。
+
+如需在当前终端查看服务日志或用 `Ctrl+C` 停止服务：
+
+```bash
+./scripts/start-web.sh
+```
+
+服务只监听本机回环地址；在“设置”中保存 Gemini Key 时，凭据只进入 macOS Keychain，不会写入项目、日志或最终 JSON。首次导入 Obsidian 时，在设置页选择 Vault 和可选子目录。
+
+先用前 60 秒验证本机环境：
+
+```bash
+read -s GEMINI_API_KEY
+export GEMINI_API_KEY
+./scripts/test.sh '/path/to/video.mp4'
+```
+
+执行完整转写：
+
+```bash
+./scripts/transcribe-video.sh '/path/to/video.mp4'
+```
+
+命令行模式下，`GEMINI_API_KEY` 只从当前终端环境读取，不写入项目文件。若 Gemini 暂不可用，可显式回退到本地 Qwen：
+
+```bash
+TRANSCRIPT_PROVIDER=ollama ./scripts/transcribe-video.sh '/path/to/video.mp4'
+```
+
+每次任务的时间轴证据位于 `outputs/<video-name>/transcript.final.json`；阅读与导入交付物为从它生成的 `transcript.final.md`。Whisper 原始 JSON 仅作为 `work/` 中的中间证据保留。旧版 SRT 字幕仍在输出目录中，仅用于回退。
+
+升级后的流程会复用已有有效 WAV 和 Whisper JSON，避免重复执行 ASR。首次 Gemini 成功写入前，现有 Qwen 最终 JSON 会备份为 `transcript.qwen.json`；Gemini 候选结果通过完整校验后才原子替换 `transcript.final.json`。现有 SRT 脚本在迁移阶段保留作为回退，不再作为默认输出路径。
+
+## 文档
+
+- [设计记录](docs/design.md)
