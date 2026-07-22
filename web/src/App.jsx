@@ -11,6 +11,7 @@ import {
   Eye,
   FileText,
   FolderOpen,
+  Home,
   KeyRound,
   Leaf,
   ListTree,
@@ -174,6 +175,52 @@ function VideoCard({ video, task, onPick, onStart, disabled }) {
   </section>;
 }
 
+function formatMonthlyDuration(value) {
+  const seconds = Math.max(0, Math.round(Number(value) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours ? `${hours} 小时 ${minutes} 分` : `${minutes} 分钟`;
+}
+
+function FlipNumber({ value, label }) {
+  return <span className="flip-number" aria-label={label}>{String(value).split("").map((character, index) => /\d/.test(character) ? <span className="flip-digit" key={`${index}-${character}`}>{character}</span> : <span className="flip-symbol" key={`${index}-${character}`}>{character}</span>)}</span>;
+}
+
+function HomeView({ video, task, dashboard, onPick, onStart, onOpenHistory, onViewHistory, onWorkbench }) {
+  const running = task?.status === "running" || task?.status === "queued";
+  const month = dashboard?.month || { duration_seconds: 0, completed_count: 0 };
+  const recent = dashboard?.recent_records || [];
+  const progressDescription = task?.block_total ? `已完成 ${task.block_index} / ${task.block_total} 组文字整理` : task?.message || "正在准备本机转写流程。";
+  return <main className="home-view">
+    <header className="home-hero">
+      <div><p className="eyebrow">本地视频转写</p><h1>让一段视频，<br />成为一篇好读的文章。</h1><p>从原始语音到可阅读 Markdown，全程在你的工作流里完成。</p></div>
+      <button className="primary-button home-create" onClick={onPick} disabled={running}><FolderOpen size={18} />{video ? "更换视频" : "新建转写"}</button>
+    </header>
+
+    <section className="home-import" aria-label="新建单视频转写">
+      {video ? <div className="home-selected-video"><div className="home-selected-art"><Cover src={video.cover_url} /></div><div><p className="eyebrow">已选择视频</p><strong>{video.name}</strong><span>{formatDuration(video.duration_seconds)}　·　{formatSize(video.size_bytes)}　·　{video.name.split(".").pop().toUpperCase()}</span></div><div className="home-selected-actions"><button className="quiet-button" onClick={onPick} disabled={running}>更换</button><button className="primary-button" onClick={onStart} disabled={running}><Play size={17} fill="currentColor" />开始转写</button></div></div> : <button className="home-import-pick" onClick={onPick} disabled={running}><span className="home-import-icon"><Upload size={24} /></span><span><strong>选择一段本地视频</strong><small>视频只在这台 Mac 上读取，不会上传或复制。</small></span><span className="home-import-action">选择视频 <FolderOpen size={16} /></span></button>}
+      <div className="home-batch" aria-label="批量导入即将支持"><FolderOpen size={18} /><span><strong>文件夹批量导入</strong><small>正在设计安全队列与错误恢复机制</small></span><em>即将支持</em></div>
+    </section>
+
+    <section className="home-status-grid" aria-label="转写概览">
+      <article className={`home-task-card ${running ? "is-running" : ""}`}>
+        <div className="home-card-heading"><span>正在进行</span>{running && <span className="home-live"><i />实时更新</span>}</div>
+        {running ? <><div className="home-task-title"><Sparkles size={20} /><div><strong>{task.stage}</strong><small>{task.source?.name}</small></div><FlipNumber value={`${task.percent}%`} label={`当前进度 ${task.percent}%`} /></div><div className="home-progress"><span style={{ width: `${task.percent}%` }} /></div><div className="home-task-meta"><span>{progressDescription}</span><button onClick={onWorkbench}>打开工作台</button></div></> : <div className="home-idle"><Clock3 size={23} /><div><strong>当前没有正在运行的转写</strong><span>选择视频后，进度会在这里实时显示。</span></div></div>}
+      </article>
+      <article className="home-month-card">
+        <div className="home-card-heading"><span>本月已转写</span><span>{month.completed_count} 份完成</span></div>
+        <strong className="home-month-number"><FlipNumber value={formatMonthlyDuration(month.duration_seconds)} label={`本月已转写 ${formatMonthlyDuration(month.duration_seconds)}`} /></strong>
+        <p>仅统计本月已完成且通过验证的视频时长。</p>
+      </article>
+    </section>
+
+    <section className="home-recent" aria-labelledby="home-recent-heading">
+      <header><div><p className="eyebrow">回顾</p><h2 id="home-recent-heading">最近转写</h2></div><button className="home-text-button" onClick={onViewHistory}>查看全部</button></header>
+      {recent.length ? <div className="home-recent-list">{recent.map((record) => <button className="home-recent-item" key={record.id} onClick={() => onOpenHistory(record)}><div className="home-recent-cover"><Cover src={record.cover_url} /></div><div><strong>{record.title}</strong><span>{record.source_name}</span></div><small>{formatDuration(record.duration_seconds)}</small><time>{formatDate(record.completed_at)}</time></button>)}</div> : <div className="home-recent-empty"><BookOpen size={23} /><span>完成第一份转写后，它会在这里出现。</span></div>}
+    </section>
+  </main>;
+}
+
 function HistoryView({ history, selected, markdown, settings, onOpen, onCopy, onImport, onSettings }) {
   return <main className="history-view">
     <header className="view-heading"><p className="eyebrow">已完成的文稿</p><h1>回到任何一次转写</h1><p>所有记录都从本机输出目录读取，可继续浏览、导出或导入知识库。</p></header>
@@ -194,7 +241,7 @@ function SettingsView({ settings, setSettings, onSave, onPickVault, onSaveKey, o
 }
 
 export function App() {
-  const [view, setView] = useState("workbench");
+  const [view, setView] = useState("home");
   const [theme, setTheme] = useState(() => window.localStorage.getItem("quiet-transcript-theme") === "dark" ? "dark" : "light");
   const [settings, setSettings] = useState(null);
   const [selectedVideo, setSelectedVideo] = useState(null);
@@ -203,17 +250,18 @@ export function App() {
   const [history, setHistory] = useState([]);
   const [selectedHistory, setSelectedHistory] = useState(null);
   const [historyMarkdown, setHistoryMarkdown] = useState("");
+  const [dashboard, setDashboard] = useState(null);
   const [toast, setToast] = useState("");
   const [saving, setSaving] = useState(false);
 
   const showToast = (message) => { setToast(message); window.setTimeout(() => setToast(""), 3600); };
   const loadHistory = async () => { try { setHistory((await api("/api/history")).records); } catch (error) { showToast(error.message); } };
+  const loadDashboard = async () => { try { const next = await api("/api/dashboard"); setDashboard(next); setTask((current) => current || next.current_task); if (next.current_task?.has_markdown) loadMarkdown(next.current_task.id); } catch (error) { showToast(error.message); } };
   const loadMarkdown = async (id) => { try { setMarkdown(await api(`/api/tasks/${encodeURIComponent(id)}/markdown`)); } catch { setMarkdown(""); } };
   const openHistory = async (record) => { setSelectedHistory(record); setHistoryMarkdown(""); try { setHistoryMarkdown(await api(`/api/history/${encodeURIComponent(record.id)}/markdown`)); } catch (error) { showToast(error.message); } };
   useEffect(() => {
     api("/api/settings").then(setSettings).catch((error) => showToast(error.message));
-    loadHistory();
-    api("/api/tasks/current").then((current) => { if (current) { setTask(current); if (current.has_markdown) loadMarkdown(current.id); } }).catch(() => {});
+    loadDashboard();
   }, []);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -222,7 +270,7 @@ export function App() {
   useEffect(() => {
     if (!task?.id || task.status !== "running") return undefined;
     const events = new EventSource(`/api/tasks/${encodeURIComponent(task.id)}/events`);
-    events.addEventListener("task", (event) => { const next = JSON.parse(event.data); setTask(next); if (next.status === "completed") { loadMarkdown(next.id); loadHistory(); } });
+    events.addEventListener("task", (event) => { const next = JSON.parse(event.data); setTask(next); if (next.status === "completed") { loadMarkdown(next.id); loadHistory(); loadDashboard(); } });
     events.onerror = () => events.close();
     return () => events.close();
   }, [task?.id, task?.status]);
@@ -235,12 +283,13 @@ export function App() {
   const deleteKey = async () => { try { await api("/api/settings/gemini-key", { method: "DELETE" }); setSettings({ ...settings, gemini_key_configured: false }); showToast("Gemini Key 已从 Keychain 删除。"); } catch (error) { showToast(error.message); } };
   const copyMarkdown = async (content) => { try { await navigator.clipboard.writeText(content); showToast("已复制完整 Markdown。"); } catch { showToast("浏览器没有授予剪贴板权限。请使用下载文件。"); } };
   const importDocument = async (record) => { const base = record?.kind === "history" ? "/api/history" : "/api/tasks"; try { const result = await api(`${base}/${encodeURIComponent(record.id)}/obsidian`, { method: "POST" }); showToast(`已写入 Obsidian：${result.name}`); } catch (error) { showToast(error.message); } };
+  const openHistoryFromHome = (record) => { setView("history"); openHistory(record); loadHistory(); };
   const running = task?.status === "running" || task?.status === "queued";
   const taskRecord = task ? { id: task.id, kind: "task" } : null;
 
   return <div className="app-shell">
-    <aside className="sidebar"><div className="brand"><span className="brand-mark"><Leaf size={25} fill="currentColor" /></span><div><strong>Quiet Transcript</strong><small>安静地，把视频变成文字</small></div></div><nav aria-label="主导航"><button className={view === "workbench" ? "nav-item selected" : "nav-item"} onClick={() => setView("workbench")}><FileText size={19} />转写工作台</button><button className={view === "history" ? "nav-item selected" : "nav-item"} onClick={() => { setView("history"); loadHistory(); }}><Clock3 size={19} />历史记录</button><button className={view === "settings" ? "nav-item selected" : "nav-item"} onClick={() => setView("settings")}><Settings size={19} />设置</button><button className="nav-item theme-toggle" aria-label={theme === "dark" ? "切换至浅色模式" : "切换至夜间模式"} aria-pressed={theme === "dark"} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={19} /> : <Moon size={19} />}<span>{theme === "dark" ? "浅色模式" : "夜间模式"}</span></button></nav><div className="sidebar-footer"><span><CircleDot size={11} fill="currentColor" />本机工作台 · 安全控制</span><small>macOS · Apple Silicon</small></div></aside>
-    <div className="page-shell">{view === "settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} onPickVault={pickVault} onSaveKey={saveKey} onDeleteKey={deleteKey} saving={saving} toast={toast} /> : view === "history" ? <HistoryView history={history} selected={selectedHistory} markdown={historyMarkdown} settings={settings} onOpen={openHistory} onCopy={copyMarkdown} onImport={importDocument} onSettings={() => setView("settings")} /> : <main className="workbench"><header className="hero"><p className="eyebrow">本地视频转写</p><h1>把视频变成一篇好读的文章</h1></header><VideoCard video={selectedVideo} task={task} onPick={chooseVideo} onStart={startTask} disabled={running} /><TaskTimeline task={task} />{task?.status === "failed" && <div className="failure"><AlertCircle size={19} /><div><strong>{task.stage}</strong><p>{task.error}</p></div></div>}{running && <section className="progress-panel"><div className="progress-heading"><div><Sparkles size={22} /><div><strong>{task.stage}</strong><span>{task.message}</span></div></div><span>{task.percent}%</span></div><div className="progress-track"><span style={{ width: `${task.percent}%` }} /></div><div className="progress-meta">{task.block_total ? `已完成 ${task.block_index} / ${task.block_total} 组文字整理` : "任务在本机运行；完成后会自动显示 Markdown。"}<details><summary>查看运行日志 <ChevronDown size={14} /></summary><pre>{task.logs.join("\n") || "正在等待第一条日志…"}</pre></details></div></section>}<DocumentReader markdown={markdown} record={taskRecord} settings={settings} onCopy={copyMarkdown} onImport={importDocument} onSettings={() => setView("settings")} /></main>}</div>
+    <aside className="sidebar"><div className="brand"><span className="brand-mark"><Leaf size={25} fill="currentColor" /></span><div><strong>Quiet Transcript</strong><small>安静地，把视频变成文字</small></div></div><nav aria-label="主导航"><button className={view === "home" ? "nav-item selected" : "nav-item"} onClick={() => { setView("home"); loadDashboard(); }}><Home size={19} />首页</button><button className={view === "workbench" ? "nav-item selected" : "nav-item"} onClick={() => setView("workbench")}><FileText size={19} />转写工作台</button><button className={view === "history" ? "nav-item selected" : "nav-item"} onClick={() => { setView("history"); loadHistory(); }}><Clock3 size={19} />历史记录</button><button className={view === "settings" ? "nav-item selected" : "nav-item"} onClick={() => setView("settings")}><Settings size={19} />设置</button><button className="nav-item theme-toggle" aria-label={theme === "dark" ? "切换至浅色模式" : "切换至夜间模式"} aria-pressed={theme === "dark"} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={19} /> : <Moon size={19} />}<span>{theme === "dark" ? "浅色模式" : "夜间模式"}</span></button></nav><div className="sidebar-footer"><span><CircleDot size={11} fill="currentColor" />本机工作台 · 安全控制</span><small>macOS · Apple Silicon</small></div></aside>
+    <div className="page-shell">{view === "settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} onPickVault={pickVault} onSaveKey={saveKey} onDeleteKey={deleteKey} saving={saving} toast={toast} /> : view === "history" ? <HistoryView history={history} selected={selectedHistory} markdown={historyMarkdown} settings={settings} onOpen={openHistory} onCopy={copyMarkdown} onImport={importDocument} onSettings={() => setView("settings")} /> : view === "home" ? <HomeView video={selectedVideo} task={task} dashboard={dashboard} onPick={chooseVideo} onStart={startTask} onOpenHistory={openHistoryFromHome} onViewHistory={() => { setView("history"); loadHistory(); }} onWorkbench={() => setView("workbench")} /> : <main className="workbench"><header className="hero"><p className="eyebrow">本地视频转写</p><h1>把视频变成一篇好读的文章</h1></header><VideoCard video={selectedVideo} task={task} onPick={chooseVideo} onStart={startTask} disabled={running} /><TaskTimeline task={task} />{task?.status === "failed" && <div className="failure"><AlertCircle size={19} /><div><strong>{task.stage}</strong><p>{task.error}</p></div></div>}{running && <section className="progress-panel"><div className="progress-heading"><div><Sparkles size={22} /><div><strong>{task.stage}</strong><span>{task.message}</span></div></div><span>{task.percent}%</span></div><div className="progress-track"><span style={{ width: `${task.percent}%` }} /></div><div className="progress-meta">{task.block_total ? `已完成 ${task.block_index} / ${task.block_total} 组文字整理` : "任务在本机运行；完成后会自动显示 Markdown。"}<details><summary>查看运行日志 <ChevronDown size={14} /></summary><pre>{task.logs.join("\n") || "正在等待第一条日志…"}</pre></details></div></section>}<DocumentReader markdown={markdown} record={taskRecord} settings={settings} onCopy={copyMarkdown} onImport={importDocument} onSettings={() => setView("settings")} /></main>}</div>
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
 }

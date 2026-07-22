@@ -11,6 +11,39 @@ def require(value, message):
         raise ValueError(message)
 
 
+def excluded_source_ids(final, whisper):
+    source = final.get("source")
+    require(isinstance(source, dict), "缺少 source")
+    excluded = source.get("excluded_segments", [])
+    require(isinstance(excluded, list), "excluded_segments 必须为数组")
+    rows = whisper["transcription"]
+    ids = []
+    for item in excluded:
+        require(isinstance(item, dict), "排除分段格式无效")
+        identifier = item.get("id")
+        reason = item.get("reason")
+        require(type(identifier) is int and 0 <= identifier < len(rows), "排除分段 ID 无效")
+        require(reason in {"segment_not_object", "empty_text", "invalid_offsets", "non_positive_duration"}, "排除分段原因无效")
+        require(identifier not in ids, "排除分段 ID 重复")
+        raw = rows[identifier]
+        if reason == "segment_not_object":
+            require(not isinstance(raw, dict), "排除分段原因不匹配")
+        else:
+            require(isinstance(raw, dict), "排除分段原因不匹配")
+            text = str(raw.get("text", "")).strip()
+            offsets = raw.get("offsets")
+            has_offsets = isinstance(offsets, dict) and type(offsets.get("from")) is int and type(offsets.get("to")) is int
+            if reason == "empty_text":
+                require(not text, "排除分段原因不匹配")
+            elif reason == "invalid_offsets":
+                require(text and not has_offsets, "排除分段原因不匹配")
+            else:
+                require(text and has_offsets and offsets["from"] >= offsets["to"], "排除分段原因不匹配")
+        ids.append(identifier)
+    require(ids == sorted(ids), "排除分段 ID 未按原顺序排列")
+    return ids
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("final_json", type=Path)
@@ -18,7 +51,8 @@ def main():
     args = parser.parse_args()
     final = json.loads(args.final_json.read_text(encoding="utf-8"))
     whisper = json.loads(args.whisper_json.read_text(encoding="utf-8"))
-    expected_ids = list(range(len(whisper["transcription"])))
+    excluded_ids = excluded_source_ids(final, whisper)
+    expected_ids = [identifier for identifier in range(len(whisper["transcription"])) if identifier not in set(excluded_ids)]
     require(final.get("schema_version") == "1.0", "schema_version 必须为 1.0")
     require(isinstance(final.get("title"), str) and final["title"].strip(), "缺少总标题")
     require(isinstance(final.get("summary"), str) and final["summary"].strip(), "缺少总摘要")
@@ -50,7 +84,7 @@ def main():
             whisper["transcription"][section_ids[-1]]["offsets"]["to"],
         ), "章节时间不等于段落范围")
     require(covered == expected_ids, "来源分段必须按原顺序恰好引用一次")
-    print(json.dumps({"status": "ok", "segments": len(expected_ids), "sections": len(final["sections"])}, ensure_ascii=False))
+    print(json.dumps({"status": "ok", "segments": len(expected_ids), "excluded_segments": len(excluded_ids), "sections": len(final["sections"])}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

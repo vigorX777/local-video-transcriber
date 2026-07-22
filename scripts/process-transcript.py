@@ -31,7 +31,7 @@ GEMINI_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "0"))
 OLLAMA_API_URL = "http://127.0.0.1:11434/api/chat"
 NUM_CTX = os.environ.get("OLLAMA_NUM_CTX")
 MAX_CHARS = 6000
-CACHE_VERSION = "v11-" + re.sub(r"[^a-z0-9]+", "-", f"{PROVIDER}-{MODEL}".lower()).strip("-")
+CACHE_VERSION = "v12-" + re.sub(r"[^a-z0-9]+", "-", f"{PROVIDER}-{MODEL}".lower()).strip("-")
 MIN_PARAGRAPH_CHARS = 80
 MAX_PARAGRAPH_CHARS = 260
 TARGET_GROUP_CHARS = 160
@@ -239,16 +239,37 @@ def chat(messages, response_format=None, progress=None):
 
 
 def source_segments(whisper):
-    segments = []
-    for identifier, item in enumerate(whisper["transcription"]):
-        text = str(item.get("text", "")).strip()
-        start, end = item["offsets"]["from"], item["offsets"]["to"]
-        if not text or not isinstance(start, int) or not isinstance(end, int) or start >= end:
-            raise ValueError(f"Whisper 第 {identifier} 段无效")
+    transcription = whisper.get("transcription")
+    if not isinstance(transcription, list):
+        raise ValueError("Whisper JSON 不含分段数组")
+    segments, excluded = [], []
+    for identifier, item in enumerate(transcription):
+        reason = None
+        text = ""
+        start = end = None
+        if not isinstance(item, dict):
+            reason = "segment_not_object"
+        else:
+            text = str(item.get("text", "")).strip()
+            offsets = item.get("offsets")
+            if isinstance(offsets, dict) and type(offsets.get("from")) is int and type(offsets.get("to")) is int:
+                start, end = offsets["from"], offsets["to"]
+            if not text:
+                reason = "empty_text"
+            elif start is None or end is None:
+                reason = "invalid_offsets"
+            else:
+                if start >= end:
+                    reason = "non_positive_duration"
+        if reason:
+            excluded.append({"id": identifier, "reason": reason, "start_ms": start, "end_ms": end})
+            continue
         segments.append({"id": identifier, "text": text, "start_ms": start, "end_ms": end})
+    if len(excluded) > max(10, len(transcription) // 100):
+        raise ValueError(f"Whisper 无效分段过多（{len(excluded)} / {len(transcription)}），请重新转写")
     if not segments:
         raise ValueError("Whisper JSON 不含有效分段")
-    return segments
+    return segments, excluded
 
 
 def make_source_groups(segments):
@@ -487,7 +508,7 @@ def main():
         raise ValueError("TRANSCRIPT_PROVIDER 仅支持 gemini 或 ollama")
     started = now()
     whisper = json.loads(args.whisper_json.read_text(encoding="utf-8"))
-    segments = source_segments(whisper)
+    segments, excluded_segments = source_segments(whisper)
     source_groups = make_source_groups(segments)
     blocks = make_blocks(source_groups)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -517,7 +538,7 @@ def main():
             paragraphs.append({"start_ms": group["segments"][0]["start_ms"], "end_ms": group["segments"][-1]["end_ms"], "source_segment_ids": ids, "text": item["text"].strip()})
         sections.append({"id": index, "title": meta["section_titles"][index - 1]["title"].strip(), "start_ms": paragraphs[0]["start_ms"], "end_ms": paragraphs[-1]["end_ms"], "paragraphs": paragraphs})
     finished = now()
-    result = {"schema_version": "1.0", "source": {"path": str(Path(args.source).resolve()), "duration_seconds": args.duration_seconds, "detected_language": whisper.get("result", {}).get("language", "unknown")}, "models": {"asr": "whisper-large-v3-turbo", "editor": MODEL}, "title": meta["title"].strip(), "summary": meta["summary"].strip(), "sections": sections, "run": {"started_at": started, "finished_at": finished, "elapsed_seconds": max(0, int(datetime.fromisoformat(finished.replace("Z", "+00:00")).timestamp() - datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()))}}
+    result = {"schema_version": "1.0", "source": {"path": str(Path(args.source).resolve()), "duration_seconds": args.duration_seconds, "detected_language": whisper.get("result", {}).get("language", "unknown"), "excluded_segments": excluded_segments}, "models": {"asr": "whisper-large-v3-turbo", "editor": MODEL}, "title": meta["title"].strip(), "summary": meta["summary"].strip(), "sections": sections, "run": {"started_at": started, "finished_at": finished, "elapsed_seconds": max(0, int(datetime.fromisoformat(finished.replace("Z", "+00:00")).timestamp() - datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()))}}
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, args.output)

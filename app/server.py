@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -32,6 +33,7 @@ DEFAULT_SETTINGS = {
     "obsidian_vault": "",
     "obsidian_subdir": "",
 }
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def utc_now() -> str:
@@ -496,6 +498,37 @@ def list_history_records() -> list[Dict[str, Any]]:
     return [record for _, record in sorted(records, key=lambda item: item[0], reverse=True)]
 
 
+def dashboard_summary() -> Dict[str, Any]:
+    records = list_history_records()
+    now = datetime.now(SHANGHAI_TZ)
+    month_seconds = 0.0
+    month_count = 0
+    for record in records:
+        completed_at = record.get("completed_at")
+        if not isinstance(completed_at, str):
+            continue
+        try:
+            completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00")).astimezone(SHANGHAI_TZ)
+        except ValueError:
+            continue
+        if (completed.year, completed.month) != (now.year, now.month):
+            continue
+        month_count += 1
+        duration = record.get("duration_seconds")
+        if isinstance(duration, (int, float)) and duration >= 0:
+            month_seconds += float(duration)
+    task = manager.get_current()
+    return {
+        "current_task": task.public() if task else None,
+        "recent_records": records[:4],
+        "month": {
+            "year_month": now.strftime("%Y-%m"),
+            "completed_count": month_count,
+            "duration_seconds": round(month_seconds, 2),
+        },
+    }
+
+
 def ensure_history_markdown(output_dir: Path) -> Path:
     markdown_path = output_dir / "transcript.final.md"
     if markdown_path.is_file():
@@ -588,6 +621,11 @@ def create_task(payload: TaskPayload):
 def current_task():
     task = manager.get_current()
     return task.public() if task else None
+
+
+@app.get("/api/dashboard")
+def dashboard():
+    return dashboard_summary()
 
 
 @app.post("/api/tasks/{task_id}/retry")

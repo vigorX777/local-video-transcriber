@@ -49,6 +49,22 @@ class ProcessTranscriptTests(unittest.TestCase):
         self.assertFalse(process_transcript.retryable_gemini_error(process_transcript.genai_errors.ClientError(403, {})))
         self.assertTrue(process_transcript.retryable_gemini_error(process_transcript.genai_errors.ServerError(503, {})))
 
+    def test_source_segments_excludes_zero_duration_artifacts(self):
+        segments, excluded = process_transcript.source_segments({"transcription": [
+            {"text": "有效分段", "offsets": {"from": 0, "to": 500}},
+            {"text": "重复重复", "offsets": {"from": 500, "to": 500}},
+            {"text": "后续分段", "offsets": {"from": 500, "to": 900}},
+        ]})
+        self.assertEqual([item["id"] for item in segments], [0, 2])
+        self.assertEqual(excluded, [{"id": 1, "reason": "non_positive_duration", "start_ms": 500, "end_ms": 500}])
+
+    def test_source_segments_rejects_excessive_invalid_data(self):
+        with self.assertRaisesRegex(ValueError, "无效分段过多"):
+            process_transcript.source_segments({"transcription": [
+                {"text": "无效", "offsets": {"from": 0, "to": 0}}
+                for _ in range(11)
+            ]})
+
 
 if __name__ == "__main__":
     unittest.main()

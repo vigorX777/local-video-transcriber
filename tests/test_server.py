@@ -71,6 +71,36 @@ class ServerTests(unittest.TestCase):
         finally:
             server.PROJECT_ROOT = original_root
 
+    def test_dashboard_uses_verified_history_without_source_paths(self):
+        original_root = server.PROJECT_ROOT
+        original_task = server.manager.current
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output = root / "outputs" / "verified-run"
+                output.mkdir(parents=True)
+                source = root / "private" / "video.mp4"
+                now = server.datetime.now(server.SHANGHAI_TZ).replace(microsecond=0)
+                (output / "transcript.final.json").write_text(
+                    server.json.dumps({
+                        "source": {"path": str(source), "duration_seconds": 95},
+                        "models": {"editor": "gemini-2.5-flash"},
+                        "title": "首页统计测试",
+                        "run": {"finished_at": now.isoformat()},
+                    }, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                server.PROJECT_ROOT = root
+                server.manager.current = None
+                summary = server.dashboard_summary()
+                self.assertEqual(summary["month"]["completed_count"], 1)
+                self.assertEqual(summary["month"]["duration_seconds"], 95)
+                self.assertEqual(summary["recent_records"][0]["title"], "首页统计测试")
+                self.assertNotIn(str(source), server.json.dumps(summary, ensure_ascii=False))
+        finally:
+            server.PROJECT_ROOT = original_root
+            server.manager.current = original_task
+
     def test_task_starts_in_a_background_thread(self):
         original_root = server.PROJECT_ROOT
         original_task = server.manager.current
