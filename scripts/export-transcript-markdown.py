@@ -13,7 +13,12 @@ def main():
     args = parser.parse_args()
     started = time.perf_counter()
     transcript = json.loads(args.input.read_text(encoding="utf-8"))
-    lines = [f"# {transcript['title']}", "", f"> 源视频：{Path(transcript['source']['path']).name}", "", "## 内容摘要", "", transcript["summary"].strip(), ""]
+    source = transcript["source"]
+    if source.get("kind") == "network" and source.get("source_url"):
+        source_line = f"> 源视频：[{source.get('title') or Path(source['path']).name}]({source['source_url']})（{source.get('platform_label') or source.get('platform') or '网络视频'}）"
+    else:
+        source_line = f"> 源视频：{Path(source['path']).name}"
+    lines = [f"# {transcript['title']}", "", source_line, "", "## 内容摘要", "", transcript["summary"].strip(), ""]
     paragraphs = 0
     for section in transcript["sections"]:
         lines.extend([f"## {section['id']}. {section['title']}", ""])

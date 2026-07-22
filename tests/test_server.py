@@ -35,6 +35,29 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn("/Users/example", value)
         self.assertIn("[本机路径]", value)
 
+    def test_processing_failure_detail_exposes_only_the_safe_validation_reason(self):
+        detail = server.processing_failure_detail([
+            "已复用已有 Whisper 结果。",
+            "JSON 文本处理失败：来源组 0–3 处理失败：来源组 0 段落长度为 278，必须在 60–320 字之间",
+        ])
+        self.assertEqual(detail, "来源组 0–3 处理失败：来源组 0 段落长度为 278，必须在 60–320 字之间")
+
+    def test_network_retry_reuses_persisted_source_manifest_without_preflight(self):
+        manager = server.TaskManager()
+        task = server.LocalTask(
+            Path("/tmp/network-bilibili-BVtest"),
+            {"name": "公开单视频", "size_bytes": None, "duration_seconds": 60},
+            server.DEFAULT_SETTINGS,
+            Path("/tmp/network-bilibili-BVtest-output"),
+            {"platform": "bilibili", "content_id": "BVtest", "source_url": "https://www.bilibili.com/video/BVtest"},
+            "keep_video",
+        )
+        task.status = "failed"
+        manager.current = task
+        with patch.object(manager, "start_network", return_value=task) as start_network:
+            self.assertIs(manager.retry(task.id), task)
+        start_network.assert_called_once_with(task.origin, "keep_video", resume=True)
+
     def test_cover_seek_time_is_bounded_and_uses_video_progress(self):
         self.assertEqual(server.cover_seek_seconds(None), 8)
         self.assertEqual(server.cover_seek_seconds(20), 8)
@@ -120,6 +143,56 @@ class ServerTests(unittest.TestCase):
         finally:
             server.PROJECT_ROOT = original_root
             server.manager.current = original_task
+
+    def test_completed_network_task_keeps_network_metadata_after_restart(self):
+        original_root = server.PROJECT_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output = root / "outputs" / "network-bilibili-BVtest"
+                media = root / "downloads" / "network-bilibili-BVtest-video.mp4"
+                output.mkdir(parents=True)
+                media.parent.mkdir(parents=True)
+                media.touch()
+                (output / "transcript.final.json").write_text(server.json.dumps({
+                    "source": {"path": str(media), "duration_seconds": 55},
+                    "title": "测试文稿",
+                    "run": {"finished_at": "2026-07-22T09:00:00Z"},
+                }), encoding="utf-8")
+                (output / "transcript.final.md").write_text("# 测试文稿\n", encoding="utf-8")
+                (output / "web-task.json").write_text(server.json.dumps({
+                    "source_kind": "network",
+                    "status": "completed",
+                    "stage": "已完成",
+                    "percent": 100,
+                    "message": "已补齐原视频，已有文稿未重复转写。",
+                    "source_path": str(media),
+                    "download_mode": "keep_video",
+                    "source": {
+                        "name": "公开单视频",
+                        "size_bytes": 3,
+                        "duration_seconds": 55,
+                    },
+                    "origin": {
+                        "platform": "bilibili",
+                        "platform_label": "B站",
+                        "content_id": "BVtest",
+                        "title": "公开单视频",
+                        "author": "作者",
+                        "duration_seconds": 55,
+                        "source_url": "https://www.bilibili.com/video/BVtest",
+                    },
+                }), encoding="utf-8")
+                server.PROJECT_ROOT = root
+                with patch.object(server, "load_settings", return_value=server.DEFAULT_SETTINGS):
+                    recovered = server.TaskManager().current
+                self.assertEqual(recovered.status, "completed")
+                self.assertEqual(recovered.source_kind, "network")
+                self.assertEqual(recovered.origin["platform_label"], "B站")
+                self.assertEqual(recovered.metadata["name"], "公开单视频")
+                self.assertEqual(len(recovered.public()["stages"]), 7)
+        finally:
+            server.PROJECT_ROOT = original_root
 
     def test_obsidian_import_keeps_existing_note(self):
         original_root = server.PROJECT_ROOT

@@ -40,7 +40,8 @@ done
 model="$project_root/models/ggml-large-v3-turbo.bin"
 [[ -s "$model" ]] || { echo "模型不存在，请先运行 scripts/setup.sh" >&2; exit 1; }
 
-task_name="$(basename "${input%.*}")"
+task_name="${TRANSCRIPT_TASK_NAME:-$(basename "${input%.*}")}"
+[[ "$task_name" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "任务名称包含不安全字符" >&2; exit 2; }
 work_dir="$project_root/work/$task_name"
 output_dir="$project_root/outputs/$task_name"
 audio="$work_dir/audio.wav"
@@ -98,10 +99,16 @@ PY
 fi
 
 progress "文本整理" 34 "正在准备带来源映射的文本块。"
-python3 "$project_root/scripts/process-transcript.py" "$whisper_json" "$candidate_json" \
-  --source "$input" \
-  --duration-seconds "$duration_seconds" \
+process_args=(
+  "$whisper_json" "$candidate_json"
+  --source "$input"
+  --duration-seconds "$duration_seconds"
   --cache-dir "$work_dir/transcript-cache"
+)
+if [[ -n "${TRANSCRIPT_SOURCE_MANIFEST:-}" ]]; then
+  process_args+=(--source-manifest "$TRANSCRIPT_SOURCE_MANIFEST")
+fi
+python3 "$project_root/scripts/process-transcript.py" "${process_args[@]}"
 progress "结构校验" 94 "正在验证时间范围和来源映射。"
 python3 "$project_root/scripts/validate-transcript-json.py" "$candidate_json" --whisper-json "$whisper_json"
 mv -f "$candidate_json" "$final_json"

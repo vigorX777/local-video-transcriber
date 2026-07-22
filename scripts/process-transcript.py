@@ -31,9 +31,11 @@ GEMINI_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "0"))
 OLLAMA_API_URL = "http://127.0.0.1:11434/api/chat"
 NUM_CTX = os.environ.get("OLLAMA_NUM_CTX")
 MAX_CHARS = 6000
-CACHE_VERSION = "v12-" + re.sub(r"[^a-z0-9]+", "-", f"{PROVIDER}-{MODEL}".lower()).strip("-")
+CACHE_VERSION = "v13-" + re.sub(r"[^a-z0-9]+", "-", f"{PROVIDER}-{MODEL}".lower()).strip("-")
 MIN_PARAGRAPH_CHARS = 80
 MAX_PARAGRAPH_CHARS = 260
+ENGLISH_MIN_PARAGRAPH_CHARS = 60
+ENGLISH_MAX_PARAGRAPH_CHARS = 320
 TARGET_GROUP_CHARS = 160
 MAX_GEMINI_GROUPS_PER_BLOCK = 4
 GEMINI_CONNECT_TIMEOUT_SECONDS = 8
@@ -238,7 +240,7 @@ def chat(messages, response_format=None, progress=None):
     raise RuntimeError("TRANSCRIPT_PROVIDER 仅支持 gemini 或 ollama")
 
 
-def source_segments(whisper):
+def source_segments(whisper, duration_ms=None):
     transcription = whisper.get("transcription")
     if not isinstance(transcription, list):
         raise ValueError("Whisper JSON 不含分段数组")
@@ -259,7 +261,11 @@ def source_segments(whisper):
             elif start is None or end is None:
                 reason = "invalid_offsets"
             else:
-                if start >= end:
+                if duration_ms is not None and start >= duration_ms:
+                    reason = "outside_source_duration"
+                elif duration_ms is not None and end > duration_ms:
+                    end = duration_ms
+                if reason is None and start >= end:
                     reason = "non_positive_duration"
         if reason:
             excluded.append({"id": identifier, "reason": reason, "start_ms": start, "end_ms": end})
@@ -272,10 +278,11 @@ def source_segments(whisper):
     return segments, excluded
 
 
-def make_source_groups(segments):
+def make_source_groups(segments, language="unknown"):
+    target_chars = 260 if str(language).lower().startswith("en") else TARGET_GROUP_CHARS
     groups, current, size = [], [], 0
     for segment in segments:
-        if current and size >= TARGET_GROUP_CHARS:
+        if current and size + len(segment["text"]) > target_chars:
             groups.append({"id": len(groups), "segments": current, "text": "".join(item["text"] for item in current)})
             current, size = [], 0
         current.append(segment)
@@ -289,6 +296,12 @@ def make_source_groups(segments):
             tail["id"] = len(groups)
             groups.append(tail)
     return groups
+
+
+def paragraph_limits(language):
+    if str(language).lower().startswith("en"):
+        return ENGLISH_MIN_PARAGRAPH_CHARS, ENGLISH_MAX_PARAGRAPH_CHARS
+    return MIN_PARAGRAPH_CHARS, MAX_PARAGRAPH_CHARS
 
 
 def make_blocks(groups):
@@ -305,7 +318,7 @@ def make_blocks(groups):
     return blocks
 
 
-def validate_block(value, expected_group_ids):
+def validate_block(value, expected_group_ids, minimum=MIN_PARAGRAPH_CHARS, maximum=MAX_PARAGRAPH_CHARS):
     if not isinstance(value, dict) or not str(value.get("title", "")).strip() or not str(value.get("summary", "")).strip():
         raise ValueError("模型未返回标题或摘要")
     paragraphs = value.get("paragraphs")
@@ -321,8 +334,8 @@ def validate_block(value, expected_group_ids):
             raise ValueError("模型段落格式无效")
         length = len(text.strip())
         sentence_count = len(re.findall(r"[。！？]", text))
-        if not MIN_PARAGRAPH_CHARS <= length <= MAX_PARAGRAPH_CHARS:
-            raise ValueError(f"段落长度必须在 {MIN_PARAGRAPH_CHARS}–{MAX_PARAGRAPH_CHARS} 字之间")
+        if not minimum <= length <= maximum:
+            raise ValueError(f"来源组 {group_id} 段落长度为 {length}，必须在 {minimum}–{maximum} 字之间")
         if not 2 <= sentence_count <= 3:
             raise ValueError("每段必须包含 2–3 句")
         actual_group_ids.append(group_id)
@@ -407,11 +420,11 @@ def block_format(group_count):
     }
 
 
-def process_block(block, cache_path, progress):
+def process_block(block, cache_path, progress, minimum, maximum):
     expected_group_ids = [item["id"] for item in block]
     if cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        validate_block(cached, expected_group_ids)
+        validate_block(cached, expected_group_ids, minimum, maximum)
         emit_progress(
             progress["stage"],
             progress["percent"],
@@ -422,25 +435,25 @@ def process_block(block, cache_path, progress):
             cached=True,
         )
         return cached
-    system = """你是严谨的中文视频编辑。输入是按时间排序的 Whisper 分段。返回且只返回 JSON 对象：
-{"title":"本块章节标题","summary":"本块两三句摘要","paragraphs":[{"source_group_id":整数,"text":"整理后的简体中文段落"}]}。
+    system = f"""你是严谨的中文视频编辑。输入是按时间排序的 Whisper 分段。返回且只返回 JSON 对象：
+{{"title":"本块章节标题","summary":"本块两三句摘要","paragraphs":[{{"source_group_id":整数,"text":"整理后的简体中文段落"}}]}}。
 输入 groups 已按时间排序，每个 group 都包含固定且连续的 Whisper 来源范围。每个 group 必须返回恰好一个段落，source_group_id 必须按输入顺序完整出现一次；不得合并、拆分、遗漏或调换 group。
-每个 text 必须为 80–260 个汉字或字符、表达 2 或 3 句完整语义。句末标点由本地程序统一处理。不要输出时间戳、Markdown、解释或代码围栏。
+每个 text 必须为 {minimum}–{maximum} 个汉字或字符、表达 2 或 3 句完整语义。句末标点由本地程序统一处理。不要输出时间戳、Markdown、解释或代码围栏。
 中文分段请修正明显 ASR 错字、标点和不影响语义的口语冗余，但必须保留每个来源组的全部事实、观点、问题和例子；禁止摘要、缩写、省略或将内容移到其他来源组。英文分段翻译为简体中文。对不确定的人名、术语或数字使用【待核对】标记。"""
     last_error = None
     previous_value = None
-    for attempt in range(2):
+    for attempt in range(3):
         response_value = None
         try:
             messages = [{"role": "system", "content": system}, block_prompt(block)]
             if previous_value is not None:
                 messages.extend([
                     {"role": "assistant", "content": json.dumps(previous_value, ensure_ascii=False)},
-                    {"role": "user", "content": f"上一版 JSON 未通过本地验收：{last_error}。请只返回修正后的完整 JSON；每个来源组仍须恰好一个段落，严格满足 80–260 字和 2–3 个中文句末标点。"},
+                    {"role": "user", "content": f"上一版 JSON 未通过本地验收：{last_error}。请只返回修正后的完整 JSON；每个来源组仍须恰好一个段落，严格满足 {minimum}–{maximum} 字和 2–3 个中文句末标点。"},
                 ])
             response_value = chat(messages, block_format(len(block)), progress)
             value = normalize_block(response_value)
-            validate_block(value, expected_group_ids)
+            validate_block(value, expected_group_ids, minimum, maximum)
             temporary = cache_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             os.replace(temporary, cache_path)
@@ -449,6 +462,15 @@ def process_block(block, cache_path, progress):
             last_error = error
             if response_value is not None:
                 previous_value = response_value
+            if attempt < 2:
+                emit_progress(
+                    progress["stage"],
+                    progress["percent"],
+                    f"第 {progress['request_block_index']} / {progress['block_total']} 组未通过本地校验，正在生成修正版（第 {attempt + 1} 次修正）。",
+                    block_index=progress["block_index"],
+                    block_total=progress["block_total"],
+                    request_block_index=progress["request_block_index"],
+                )
             time.sleep(1)
     raise RuntimeError(f"来源组 {expected_group_ids[0]}–{expected_group_ids[-1]} 处理失败：{last_error}")
 
@@ -503,13 +525,16 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--duration-seconds", required=True, type=float)
     parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument("--source-manifest", type=Path)
     args = parser.parse_args()
     if PROVIDER not in ("gemini", "ollama"):
         raise ValueError("TRANSCRIPT_PROVIDER 仅支持 gemini 或 ollama")
     started = now()
     whisper = json.loads(args.whisper_json.read_text(encoding="utf-8"))
-    segments, excluded_segments = source_segments(whisper)
-    source_groups = make_source_groups(segments)
+    segments, excluded_segments = source_segments(whisper, int(round(args.duration_seconds * 1000)))
+    language = whisper.get("result", {}).get("language", "unknown")
+    source_groups = make_source_groups(segments, language)
+    minimum, maximum = paragraph_limits(language)
     blocks = make_blocks(source_groups)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     processed = []
@@ -523,7 +548,7 @@ def main():
             "block_total": len(blocks),
             "request_block_index": index,
         }
-        processed.append(process_block(block, args.cache_dir / f"{CACHE_VERSION}-block-{index:03d}.json", progress))
+        processed.append(process_block(block, args.cache_dir / f"{CACHE_VERSION}-block-{index:03d}.json", progress, minimum, maximum))
         print(f"已处理第 {index} 块", file=sys.stderr)
         emit_progress(editor_stage, 35 + round(index / len(blocks) * 55), f"正在整理第 {index} / {len(blocks)} 组。", block_index=index, block_total=len(blocks))
     emit_progress("生成结构", 92, "正在汇总标题、摘要与章节。", block_index=len(blocks), block_total=len(blocks))
@@ -538,7 +563,13 @@ def main():
             paragraphs.append({"start_ms": group["segments"][0]["start_ms"], "end_ms": group["segments"][-1]["end_ms"], "source_segment_ids": ids, "text": item["text"].strip()})
         sections.append({"id": index, "title": meta["section_titles"][index - 1]["title"].strip(), "start_ms": paragraphs[0]["start_ms"], "end_ms": paragraphs[-1]["end_ms"], "paragraphs": paragraphs})
     finished = now()
-    result = {"schema_version": "1.0", "source": {"path": str(Path(args.source).resolve()), "duration_seconds": args.duration_seconds, "detected_language": whisper.get("result", {}).get("language", "unknown"), "excluded_segments": excluded_segments}, "models": {"asr": "whisper-large-v3-turbo", "editor": MODEL}, "title": meta["title"].strip(), "summary": meta["summary"].strip(), "sections": sections, "run": {"started_at": started, "finished_at": finished, "elapsed_seconds": max(0, int(datetime.fromisoformat(finished.replace("Z", "+00:00")).timestamp() - datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()))}}
+    source = {"path": str(Path(args.source).resolve()), "duration_seconds": args.duration_seconds, "detected_language": whisper.get("result", {}).get("language", "unknown"), "excluded_segments": excluded_segments}
+    if args.source_manifest:
+        manifest = json.loads(args.source_manifest.read_text(encoding="utf-8"))
+        for key in ("kind", "platform", "platform_label", "content_id", "title", "author", "source_url", "download_mode"):
+            if key in manifest:
+                source[key] = manifest[key]
+    result = {"schema_version": "1.0", "source": source, "models": {"asr": "whisper-large-v3-turbo", "editor": MODEL}, "title": meta["title"].strip(), "summary": meta["summary"].strip(), "sections": sections, "run": {"started_at": started, "finished_at": finished, "elapsed_seconds": max(0, int(datetime.fromisoformat(finished.replace("Z", "+00:00")).timestamp() - datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()))}}
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, args.output)

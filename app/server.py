@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -16,6 +17,14 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.network_media import (
+    NetworkMediaError,
+    download_network_media,
+    inspect_network_url,
+    task_id_for,
+    yt_dlp_path,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Local Video Transcriber"
@@ -23,6 +32,7 @@ SETTINGS_PATH = APP_SUPPORT / "settings.json"
 KEYCHAIN_SERVICE = "local-video-transcriber"
 KEYCHAIN_ACCOUNT = "gemini-api-key"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+MEDIA_SUFFIXES = VIDEO_SUFFIXES | {".m4a", ".mp3", ".opus", ".ogg", ".aac", ".flac", ".wav"}
 GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
 DEFAULT_SETTINGS = {
     "provider": "gemini",
@@ -32,6 +42,7 @@ DEFAULT_SETTINGS = {
     "ollama_model": "qwen2.5:14b-instruct",
     "obsidian_vault": "",
     "obsidian_subdir": "",
+    "network_download_dir": str(Path.home() / "Movies" / "Quiet Transcript"),
 }
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -66,6 +77,7 @@ def validate_settings(value: Dict[str, Any]) -> Dict[str, Any]:
     temperature = value.get("gemini_temperature")
     vault = str(value.get("obsidian_vault", "")).strip()
     subdir = str(value.get("obsidian_subdir", "")).strip().strip("/")
+    download_dir = str(value.get("network_download_dir", "")).strip()
     if provider not in {"gemini", "ollama"}:
         raise ValueError("模型提供方仅支持 Gemini 或 Ollama")
     if model not in GEMINI_MODELS:
@@ -80,6 +92,11 @@ def validate_settings(value: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Obsidian Vault 目录不存在")
     if subdir and (Path(subdir).is_absolute() or ".." in Path(subdir).parts):
         raise ValueError("Obsidian 子目录无效")
+    if not download_dir:
+        raise ValueError("请选择网络视频的下载目录")
+    download_path = Path(download_dir).expanduser()
+    if not download_path.is_absolute() or (download_path.exists() and not download_path.is_dir()):
+        raise ValueError("网络视频下载目录无效")
     return {
         "provider": provider,
         "gemini_model": model,
@@ -88,6 +105,7 @@ def validate_settings(value: Dict[str, Any]) -> Dict[str, Any]:
         "ollama_model": ollama_model,
         "obsidian_vault": vault,
         "obsidian_subdir": subdir,
+        "network_download_dir": str(download_path),
     }
 
 
@@ -143,9 +161,9 @@ def choose_video() -> Optional[Path]:
     return Path(result.stdout.strip())
 
 
-def choose_directory() -> Optional[Path]:
+def choose_directory(prompt: str = "选择 Obsidian Vault") -> Optional[Path]:
     result = subprocess.run(
-        ["osascript", "-e", 'POSIX path of (choose folder with prompt "选择 Obsidian Vault")'],
+        ["osascript", "-e", 'POSIX path of (choose folder with prompt "{}")'.format(prompt.replace('"', ''))],
         text=True,
         capture_output=True,
     )
@@ -157,6 +175,23 @@ def choose_directory() -> Optional[Path]:
 def video_metadata(path: Path) -> Dict[str, Any]:
     if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
         raise ValueError("请选择常见格式的本地视频文件")
+    metadata = {"path": str(path.resolve()), "name": path.name, "size_bytes": path.stat().st_size, "duration_seconds": None}
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        try:
+            metadata["duration_seconds"] = round(float(json.loads(result.stdout)["format"]["duration"]), 2)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return metadata
+
+
+def media_metadata(path: Path) -> Dict[str, Any]:
+    if not path.is_file() or path.suffix.lower() not in MEDIA_SUFFIXES:
+        raise ValueError("下载结果不是可转写的媒体文件")
     metadata = {"path": str(path.resolve()), "name": path.name, "size_bytes": path.stat().st_size, "duration_seconds": None}
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
@@ -215,6 +250,14 @@ def redacted(value: str, source: Optional[str] = None) -> str:
     return result.replace("GEMINI_API_KEY", "Gemini API Key")
 
 
+def processing_failure_detail(logs: list[str]) -> str:
+    prefix = "JSON 文本处理失败："
+    for line in reversed(logs):
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return ""
+
+
 class SettingsPayload(BaseModel):
     provider: str
     gemini_model: str
@@ -223,6 +266,7 @@ class SettingsPayload(BaseModel):
     ollama_model: str
     obsidian_vault: str = ""
     obsidian_subdir: str = ""
+    network_download_dir: str
 
 
 class KeyPayload(BaseModel):
@@ -233,13 +277,39 @@ class TaskPayload(BaseModel):
     source: str
 
 
+class NetworkInspectPayload(BaseModel):
+    url: str
+
+
+class NetworkTaskPayload(BaseModel):
+    media: Dict[str, Any]
+    mode: str = "transcribe_only"
+
+
 class LocalTask:
-    def __init__(self, source: Path, metadata: Dict[str, Any], settings: Dict[str, Any], output_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        source: Path,
+        metadata: Dict[str, Any],
+        settings: Dict[str, Any],
+        output_dir: Optional[Path] = None,
+        origin: Optional[Dict[str, Any]] = None,
+        download_mode: str = "",
+    ):
         self.id = output_dir.name if output_dir else source.stem
         self.source = source
         self.metadata = metadata
         self.settings = settings
         self._output_dir = output_dir
+        self.origin = origin or {}
+        self.source_kind = "network" if self.origin else "local"
+        self.download_mode = download_mode
+        self.download_percent = 0.0
+        self.downloaded_bytes = 0
+        self.download_total_bytes = 0
+        self.download_speed_bytes = None
+        self.download_eta_seconds = None
+        self.error_code = ""
         self.status = "queued"
         self.stage = "准备开始"
         self.percent = 0
@@ -263,12 +333,21 @@ class LocalTask:
 
     @property
     def state_path(self) -> Path:
-        return task_state_path(self.source)
+        return self.output_dir / "web-task.json"
 
     def public(self) -> Dict[str, Any]:
         return {
             "id": self.id,
-            "source": {key: self.metadata.get(key) for key in ("name", "size_bytes", "duration_seconds")},
+            "source": {
+                **{key: self.metadata.get(key) for key in ("name", "size_bytes", "duration_seconds")},
+                "kind": self.source_kind,
+                "platform": self.origin.get("platform", ""),
+                "platform_label": self.origin.get("platform_label", ""),
+                "author": self.origin.get("author", ""),
+                "content_id": self.origin.get("content_id", ""),
+                "source_url": self.origin.get("source_url", ""),
+                "thumbnail_url": self.origin.get("thumbnail_url", ""),
+            },
             "status": self.status,
             "stage": self.stage,
             "percent": self.percent,
@@ -276,6 +355,7 @@ class LocalTask:
             "block_index": self.block_index,
             "block_total": self.block_total,
             "error": self.error,
+            "error_code": self.error_code,
             "logs": self.logs[-80:],
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -284,12 +364,25 @@ class LocalTask:
             "model": self.settings["gemini_model"] if self.settings["provider"] == "gemini" else self.settings["ollama_model"],
             "provider": self.settings["provider"],
             "can_retry": self.status in {"failed", "interrupted"},
+            "source_kind": self.source_kind,
+            "download_mode": self.download_mode,
+            "download": {
+                "percent": round(self.download_percent, 1),
+                "downloaded_bytes": self.downloaded_bytes,
+                "total_bytes": self.download_total_bytes,
+                "speed_bytes": self.download_speed_bytes,
+                "eta_seconds": self.download_eta_seconds,
+            },
+            "stages": (["解析链接", "下载素材", "音频提取", "Whisper 识别", "内容整理", "结构校验", "生成文章"]
+                       if self.source_kind == "network" else
+                       ["音频提取", "Whisper 识别", "内容整理", "结构校验", "生成文章"]),
         }
 
     def persist(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         payload = self.public()
         payload["source_path"] = str(self.source)
+        payload["origin"] = self.origin
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, self.state_path)
@@ -316,6 +409,14 @@ class TaskManager:
         self._recover_latest()
 
     def _recover_latest(self) -> None:
+        state_candidates = []
+        for state_path in (PROJECT_ROOT / "outputs").glob("*/web-task.json"):
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if state.get("source_kind") == "network":
+                    state_candidates.append((state_path.stat().st_mtime, state_path, state))
+            except (OSError, TypeError, json.JSONDecodeError):
+                continue
         candidates = []
         for final_json in (PROJECT_ROOT / "outputs").glob("*/transcript.final.json"):
             try:
@@ -324,6 +425,40 @@ class TaskManager:
                 candidates.append((final_json.stat().st_mtime, final_json, transcript, source))
             except (OSError, KeyError, TypeError, json.JSONDecodeError):
                 continue
+        latest_final_mtime = max((item[0] for item in candidates), default=0)
+        if state_candidates:
+            state_mtime, state_path, state = max(state_candidates, key=lambda item: item[0])
+            if state_mtime >= latest_final_mtime:
+                source_data = state.get("source", {}) if isinstance(state.get("source"), dict) else {}
+                metadata = {key: source_data.get(key) for key in ("name", "size_bytes", "duration_seconds")}
+                task = LocalTask(
+                    Path(state.get("source_path") or state_path.parent),
+                    metadata,
+                    load_settings(),
+                    state_path.parent,
+                    state.get("origin") if isinstance(state.get("origin"), dict) else {},
+                    str(state.get("download_mode") or "transcribe_only"),
+                )
+                original_status = str(state.get("status") or "interrupted")
+                task.status = "interrupted" if original_status in {"queued", "running"} else original_status
+                task.stage = str(state.get("stage") or "任务已中断")
+                task.percent = int(state.get("percent") or 0)
+                task.message = str(state.get("message") or "") if task.status == "completed" else "服务重启后已恢复任务记录，可从上次成功阶段继续。"
+                task.error = "" if task.status == "completed" else str(state.get("error") or "任务在服务停止时中断。")
+                task.error_code = "" if task.status == "completed" else str(state.get("error_code") or "service_interrupted")
+                task.logs = list(state.get("logs") or [])[-120:]
+                task.block_index = int(state.get("block_index") or 0)
+                task.block_total = int(state.get("block_total") or 0)
+                task.started_at = str(state.get("started_at") or "")
+                task.finished_at = str(state.get("finished_at") or "")
+                download = state.get("download", {}) if isinstance(state.get("download"), dict) else {}
+                task.download_percent = float(download.get("percent") or 0)
+                task.downloaded_bytes = int(download.get("downloaded_bytes") or 0)
+                task.download_total_bytes = int(download.get("total_bytes") or 0)
+                task.download_speed_bytes = download.get("speed_bytes")
+                task.download_eta_seconds = download.get("eta_seconds")
+                self.current = task
+                return
         if not candidates:
             return
         _, final_json, transcript, source = max(candidates, key=lambda item: item[0])
@@ -370,15 +505,103 @@ class TaskManager:
                 raise RuntimeError("后台转写任务未能启动，请重试") from error
             return task
 
+    def start_network(self, media: Dict[str, Any], mode: str, resume: bool = False) -> LocalTask:
+        with self.lock:
+            if self.current and self.current.status in {"queued", "running"}:
+                raise RuntimeError("已有转写任务正在运行，请等待它完成")
+            if resume:
+                validated = dict(media)
+            else:
+                validated = inspect_network_url(str(media.get("source_url", "")))
+                if media.get("content_id") and validated["content_id"] != media.get("content_id"):
+                    raise NetworkMediaError("链接内容已变化，请重新验证。", "content_changed")
+            settings = load_settings()
+            if settings["provider"] == "gemini" and not key_is_configured():
+                raise RuntimeError("请先在设置中保存 Gemini API Key")
+            task_id = task_id_for(validated)
+            output_dir = PROJECT_ROOT / "outputs" / task_id
+            placeholder = Path(settings["network_download_dir"]) / task_id
+            metadata = {
+                "name": validated["title"],
+                "size_bytes": None,
+                "duration_seconds": validated.get("duration_seconds"),
+            }
+            task = LocalTask(placeholder, metadata, settings, output_dir, validated, mode)
+            self.current = task
+            task.persist()
+            runner = threading.Thread(target=self._run_network, args=(task,), daemon=True)
+            runner.start()
+            return task
+
     def retry(self, task_id: str) -> LocalTask:
         with self.lock:
             if not self.current or self.current.id != task_id or self.current.status not in {"failed", "interrupted"}:
                 raise RuntimeError("当前任务无法重试")
-            source = self.current.source
+            current = self.current
+            source = current.source
+            origin = dict(current.origin)
+            mode = current.download_mode
+        if current.source_kind == "network":
+            return self.start_network(origin, mode, resume=True)
         return self.start(source)
 
-    def _run(self, task: LocalTask) -> None:
-        task.update(status="running", stage="准备开始", message="正在检查本机依赖。", started_at=utc_now())
+    def _run_network(self, task: LocalTask) -> None:
+        task.update(status="running", stage="解析链接", percent=2, message="正在确认视频来源和可访问状态。", started_at=utc_now())
+        try:
+            resolved = dict(task.origin)
+            task.origin = resolved
+            task.update(stage="下载媒体", percent=4, message="已确认公开视频，开始下载媒体。")
+
+            def on_download(event: Dict[str, Any]) -> None:
+                percent = max(0.0, min(100.0, float(event.get("percent") or 0)))
+                task.update(
+                    stage="下载媒体",
+                    percent=4 + int(percent * 0.16),
+                    message="正在下载{}。".format("原视频" if task.download_mode == "keep_video" else "转写所需音频"),
+                    download_percent=percent,
+                    downloaded_bytes=int(event.get("downloaded_bytes") or 0),
+                    download_total_bytes=int(event.get("total_bytes") or 0),
+                    download_speed_bytes=event.get("speed_bytes"),
+                    download_eta_seconds=event.get("eta_seconds"),
+                )
+
+            manifest = download_network_media(
+                resolved,
+                task.download_mode,
+                Path(task.settings["network_download_dir"]),
+                on_download,
+            )
+            task.source = Path(manifest["local_media_path"])
+            task.metadata.update(media_metadata(task.source))
+            task.metadata["name"] = resolved["title"]
+            cover_value = manifest.get("local_cover_path")
+            if cover_value and Path(cover_value).is_file():
+                task.output_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cover_value, task.output_dir / "cover.jpg")
+            if (
+                task.download_mode == "keep_video"
+                and task.markdown_path.is_file()
+                and (task.output_dir / "transcript.final.json").is_file()
+            ):
+                task.update(
+                    status="completed",
+                    stage="已完成",
+                    percent=100,
+                    message="已补齐原视频，已有文稿未重复转写。",
+                    finished_at=utc_now(),
+                )
+                return
+            task.update(percent=20, stage="音频提取", message=("已复用下载缓存，准备转写。" if manifest.get("reused") else "媒体下载完成，准备转写。"))
+            self._run(task, network=True, source_manifest=Path(task.source).parent / "source-manifest.json")
+        except NetworkMediaError as error:
+            task.update(status="failed", stage="下载失败", error=str(error), error_code=error.code, finished_at=utc_now())
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            task.append_log(redacted(str(error), str(task.source)))
+            task.update(status="failed", stage="下载失败", error="网络媒体未能准备完成，可稍后从下载阶段重试。", error_code="download_failed", finished_at=utc_now())
+
+    def _run(self, task: LocalTask, network: bool = False, source_manifest: Optional[Path] = None) -> None:
+        if not network:
+            task.update(status="running", stage="准备开始", message="正在检查本机依赖。", started_at=utc_now())
         env = os.environ.copy()
         env.update({
             "TRANSCRIPT_PROVIDER": task.settings["provider"],
@@ -387,6 +610,10 @@ class TaskManager:
             "GEMINI_TEMPERATURE": str(task.settings["gemini_temperature"]),
             "OLLAMA_MODEL": task.settings["ollama_model"],
         })
+        if network:
+            env["TRANSCRIPT_TASK_NAME"] = task.id
+            if source_manifest:
+                env["TRANSCRIPT_SOURCE_MANIFEST"] = str(source_manifest)
         if task.settings["provider"] == "gemini":
             try:
                 env["GEMINI_API_KEY"] = read_api_key()
@@ -409,9 +636,11 @@ class TaskManager:
             if line.startswith("@@progress "):
                 try:
                     event = json.loads(line[len("@@progress "):])
+                    raw_percent = max(0, min(100, int(event.get("percent", task.percent))))
+                    mapped_percent = 20 + int(raw_percent * 0.8) if network else raw_percent
                     task.update(
                         stage=str(event.get("stage", task.stage)),
-                        percent=max(0, min(100, int(event.get("percent", task.percent)))),
+                        percent=mapped_percent,
                         message=str(event.get("message", task.message)),
                         block_index=int(event.get("block_index", task.block_index or 0)),
                         block_total=int(event.get("block_total", task.block_total or 0)),
@@ -424,7 +653,14 @@ class TaskManager:
         if result == 0 and task.markdown_path.is_file():
             task.update(status="completed", stage="已完成", percent=100, message="Markdown 已生成，可以阅读和导出。", finished_at=utc_now())
         else:
-            task.update(status="failed", stage="运行失败", error="转写流程未成功完成，请查看运行日志。", finished_at=utc_now())
+            detail = processing_failure_detail(task.logs)
+            task.update(
+                status="failed",
+                stage="内容整理失败" if detail else "运行失败",
+                error=detail or "转写流程未成功完成，请查看运行日志。",
+                error_code="transcript_failed",
+                finished_at=utc_now(),
+            )
 
 
 manager = TaskManager()
@@ -476,7 +712,7 @@ def history_record(output_dir: Path, transcript: Dict[str, Any]) -> Dict[str, An
     return {
         "id": output_dir.name,
         "title": str(transcript.get("title") or output_dir.name),
-        "source_name": source_path.name if source_path else "原始视频",
+        "source_name": str(source.get("title") or (source_path.name if source_path else "原始视频")),
         "duration_seconds": source.get("duration_seconds"),
         "model": str(models.get("editor") or "未知模型"),
         "completed_at": completed_at,
@@ -548,6 +784,13 @@ def settings_response() -> Dict[str, Any]:
     result = load_settings()
     result["gemini_key_configured"] = key_is_configured()
     result["gemini_models"] = GEMINI_MODELS
+    try:
+        yt_dlp_path()
+        version_path = PROJECT_ROOT / "tools" / "yt-dlp.version"
+        version = version_path.read_text(encoding="utf-8").strip() if version_path.is_file() else "官方独立版"
+        result["network_downloader"] = {"installed": True, "version": version}
+    except (NetworkMediaError, OSError):
+        result["network_downloader"] = {"installed": False, "version": ""}
     return result
 
 
@@ -608,6 +851,29 @@ def pick_vault():
     return {"cancelled": path is None, "path": str(path.resolve()) if path else ""}
 
 
+@app.post("/api/picker/download-directory")
+def pick_download_directory():
+    path = choose_directory("选择网络视频下载目录")
+    return {"cancelled": path is None, "path": str(path.resolve()) if path else ""}
+
+
+@app.post("/api/network/inspect")
+def inspect_network(payload: NetworkInspectPayload):
+    try:
+        return inspect_network_url(payload.url)
+    except NetworkMediaError as error:
+        raise HTTPException(status_code=400, detail={"message": str(error), "code": error.code}) from error
+
+
+@app.post("/api/network/tasks")
+def create_network_task(payload: NetworkTaskPayload):
+    try:
+        return manager.start_network(payload.media, payload.mode).public()
+    except (RuntimeError, NetworkMediaError, ValueError) as error:
+        detail = {"message": str(error), "code": getattr(error, "code", "task_failed")}
+        raise HTTPException(status_code=400, detail=detail) from error
+
+
 @app.post("/api/tasks")
 def create_task(payload: TaskPayload):
     source = Path(payload.source).expanduser().resolve()
@@ -649,7 +915,9 @@ def task_cover(task_id: str):
     task = manager.get_current()
     if not task or task.id != task_id:
         raise HTTPException(status_code=404, detail="封面不存在")
-    cover = extract_cover(task.source, task.output_dir, task.metadata.get("duration_seconds"))
+    cover = task.output_dir / "cover.jpg"
+    if not cover.is_file():
+        cover = extract_cover(task.source, task.output_dir, task.metadata.get("duration_seconds"))
     if not cover:
         raise HTTPException(status_code=404, detail="封面不存在")
     return FileResponse(cover, media_type="image/jpeg")
@@ -694,7 +962,7 @@ def download_markdown(task_id: str):
     return FileResponse(
         path,
         media_type="text/markdown; charset=utf-8",
-        filename=markdown_download_filename(task.source.name, task.finished_at, path),
+        filename=markdown_download_filename(task.metadata.get("name") or task.source.name, task.finished_at, path),
     )
 
 
@@ -731,7 +999,7 @@ def history_download(record_id: str):
     output_dir, transcript = load_history_transcript(record_id)
     path = ensure_history_markdown(output_dir)
     source = transcript.get("source", {}) if isinstance(transcript.get("source"), dict) else {}
-    source_name = source.get("path", "") if isinstance(source.get("path"), str) else ""
+    source_name = source.get("title") or (source.get("path", "") if isinstance(source.get("path"), str) else "")
     completed_at = transcript.get("run", {}).get("finished_at", "") if isinstance(transcript.get("run"), dict) else ""
     return FileResponse(
         path,

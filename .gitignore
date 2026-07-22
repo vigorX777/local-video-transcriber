@@ -17,7 +17,9 @@ design-qa.md
 models/*
 outputs/*
 work/*
+tools/*
 
 !models/.gitkeep
 !outputs/.gitkeep
 !work/.gitkeep
+!tools/.gitkeep

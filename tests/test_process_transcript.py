@@ -65,6 +65,32 @@ class ProcessTranscriptTests(unittest.TestCase):
                 for _ in range(11)
             ]})
 
+    def test_source_segments_clamps_or_excludes_offsets_beyond_media_duration(self):
+        segments, excluded = process_transcript.source_segments({"transcription": [
+            {"text": "结尾片段", "offsets": {"from": 900, "to": 1500}},
+            {"text": "越界幻觉", "offsets": {"from": 1100, "to": 1400}},
+        ]}, duration_ms=1000)
+        self.assertEqual(segments, [{"id": 0, "text": "结尾片段", "start_ms": 900, "end_ms": 1000}])
+        self.assertEqual(excluded, [{"id": 1, "reason": "outside_source_duration", "start_ms": 1100, "end_ms": 1400}])
+
+    def test_english_groups_are_large_enough_for_concise_chinese_translation(self):
+        segments = [
+            {"id": index, "text": "a" * 70, "start_ms": index * 1000, "end_ms": (index + 1) * 1000}
+            for index in range(8)
+        ]
+        english = process_transcript.make_source_groups(segments, "en")
+        chinese = process_transcript.make_source_groups(segments, "zh")
+        self.assertEqual(len(english), 3)
+        self.assertTrue(all(len(group["text"]) <= 260 for group in english))
+        self.assertGreater(len(chinese), len(english))
+
+    def test_english_output_allows_translated_paragraphs_within_english_limits(self):
+        value = {"title": "标题", "summary": "摘要", "paragraphs": [{"source_group_id": 0, "text": "a" * 29 + "。" + "b" * 29 + "。"}]}
+        minimum, maximum = process_transcript.paragraph_limits("en")
+        process_transcript.validate_block(value, [0], minimum, maximum)
+        with self.assertRaisesRegex(ValueError, "来源组 0 段落长度为 60"):
+            process_transcript.validate_block(value, [0])
+
 
 if __name__ == "__main__":
     unittest.main()
